@@ -11,13 +11,13 @@ package raft
 // expose.
 //
 // rf = NewPeer(...)
-//   Create a new Raft server.
+//   Create a new Raft server(node).
 //
 // rf.PutCommand(command interface{}) (index, term, isleader)
 //   PutCommand agreement on a new log entry
 //
 // rf.GetState() (me, term, isLeader)
-//   Ask a Raft peer for "me" (see line 58), its current term, and whether it thinks it
+//   Ask a Raft peer for "me", its current term, and whether it thinks it
 //   is a leader
 //
 // ApplyCommand
@@ -28,9 +28,9 @@ package raft
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/rand"
+	"io/ioutil"
 	"os"
 	"sync"
 	"time"
@@ -95,6 +95,121 @@ type Raft struct {
 	rand    *rand.Rand // RNG for timeout jitter
 	randMux sync.Mutex // protects rand
 }
+
+
+
+// NewPeer
+// ====
+//
+//
+// The port numbers of all the Raft servers (including this one)
+// are in peers[]
+//
+// This server's port is peers[me]
+//
+// All the servers' peers[] arrays have the same order
+//
+// applyCh
+// =======
+//
+// applyCh is a channel on which the tester or service expects
+// Raft to send ApplyCommand messages
+//
+// NewPeer() must return quickly, so it should start Goroutines
+// for any long-running work
+// NewPeer creates and returns a new Raft server instance.
+func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
+	rf := &Raft{}
+	rf.peers = peers
+	rf.me = me
+
+	if kEnableDebugLogs {
+		peerName := peers[me].String()
+		logPrefix := fmt.Sprintf("%s ", peerName)
+		if kLogToStdout {
+			rf.logger = log.New(os.Stdout, peerName, log.Lmicroseconds|log.Lshortfile)
+		} else {
+			err := os.MkdirAll(kLogOutputDir, os.ModePerm)
+			if err != nil {
+				panic(err.Error())
+			}
+			logOutputFile, err := os.OpenFile(fmt.Sprintf("%s/%s.txt", kLogOutputDir, logPrefix), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+			if err != nil {
+				panic(err.Error())
+			}
+			rf.logger = log.New(logOutputFile, logPrefix, log.Lmicroseconds|log.Lshortfile)
+		}
+		rf.logger.Println("logger initialized")
+	} else {
+		rf.logger = log.New(ioutil.Discard, "", 0)
+	}
+
+	rf.state = stateFollower
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = []LogEntry{{Term: 0}}
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mux)
+	rf.electionTimeoutMin = 400 * time.Millisecond
+	rf.electionTimeoutMax = 600 * time.Millisecond
+	rf.heartbeatInterval = 120 * time.Millisecond
+	rf.electionResetCh = make(chan struct{}, 1)
+	rf.killCh = make(chan struct{})
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano() + int64(me)))
+
+	go rf.runApplier()
+	go rf.ticker() // background goroutine drives elections
+
+	return rf
+}
+
+// ticker waits for election timeouts and triggers new elections.
+func (rf *Raft) ticker() {
+	timeout := rf.randomElectionTimeout()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			rf.mux.Lock()
+			if rf.state != stateLeader && !rf.killed() {
+				// timeout, follower should try to become leader
+				rf.startElection()
+				timeout = rf.randomElectionTimeout()
+				rf.mux.Unlock()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(timeout)
+				continue
+			}
+			timeout = rf.randomElectionTimeout()
+			rf.mux.Unlock()
+			timer.Reset(timeout)
+		case <-rf.electionResetCh:
+			// heartbeat or vote reset: restart timer with a fresh interval
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timeout = rf.randomElectionTimeout()
+			timer.Reset(timeout)
+		case <-rf.killCh:
+			// Stop() closed the channel: exit goroutine
+			return
+		}
+	}
+}
+
+
 
 // LogEntry represents a single replicated state machine command.
 type LogEntry struct {
@@ -508,117 +623,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-// NewPeer
-// ====
-//
-// The service or tester wants to create a Raft server.
-//
-// The port numbers of all the Raft servers (including this one)
-// are in peers[]
-//
-// This server's port is peers[me]
-//
-// All the servers' peers[] arrays have the same order
-//
-// applyCh
-// =======
-//
-// applyCh is a channel on which the tester or service expects
-// Raft to send ApplyCommand messages
-//
-// NewPeer() must return quickly, so it should start Goroutines
-// for any long-running work
-// NewPeer creates and returns a new Raft server instance.
-func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.me = me
-
-	if kEnableDebugLogs {
-		peerName := peers[me].String()
-		logPrefix := fmt.Sprintf("%s ", peerName)
-		if kLogToStdout {
-			rf.logger = log.New(os.Stdout, peerName, log.Lmicroseconds|log.Lshortfile)
-		} else {
-			err := os.MkdirAll(kLogOutputDir, os.ModePerm)
-			if err != nil {
-				panic(err.Error())
-			}
-			logOutputFile, err := os.OpenFile(fmt.Sprintf("%s/%s.txt", kLogOutputDir, logPrefix), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
-			if err != nil {
-				panic(err.Error())
-			}
-			rf.logger = log.New(logOutputFile, logPrefix, log.Lmicroseconds|log.Lshortfile)
-		}
-		rf.logger.Println("logger initialized")
-	} else {
-		rf.logger = log.New(ioutil.Discard, "", 0)
-	}
-
-	rf.state = stateFollower
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.log = []LogEntry{{Term: 0}}
-	rf.applyCh = applyCh
-	rf.applyCond = sync.NewCond(&rf.mux)
-	rf.electionTimeoutMin = 400 * time.Millisecond
-	rf.electionTimeoutMax = 600 * time.Millisecond
-	rf.heartbeatInterval = 120 * time.Millisecond
-	rf.electionResetCh = make(chan struct{}, 1)
-	rf.killCh = make(chan struct{})
-	rf.nextIndex = make([]int, len(peers))
-	rf.matchIndex = make([]int, len(peers))
-	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano() + int64(me)))
-
-	go rf.runApplier()
-	go rf.ticker() // background goroutine drives elections
-
-	return rf
-}
-
-// ticker waits for election timeouts and triggers new elections.
-func (rf *Raft) ticker() {
-	timeout := rf.randomElectionTimeout()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-timer.C:
-			rf.mux.Lock()
-			if rf.state != stateLeader && !rf.killed() {
-				// timeout, follower should try to become leader
-				rf.startElection()
-				timeout = rf.randomElectionTimeout()
-				rf.mux.Unlock()
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(timeout)
-				continue
-			}
-			timeout = rf.randomElectionTimeout()
-			rf.mux.Unlock()
-			timer.Reset(timeout)
-		case <-rf.electionResetCh:
-			// heartbeat or vote reset: restart timer with a fresh interval
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timeout = rf.randomElectionTimeout()
-			timer.Reset(timeout)
-		case <-rf.killCh:
-			// Stop() closed the channel: exit goroutine
-			return
-		}
-	}
-}
 
 // startElection increase the term and sends vote requests to peers.
 func (rf *Raft) startElection() {
